@@ -1,0 +1,18 @@
+# Core dependencies for PostgreSQL MCP Server
+asyncpg
+asyncio-compat
+mcp
+fastapi
+uvicorn[standard]
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+python-dotenv
+structlog
+httpx
+pydantic
+typing-extensions
+pytest
+pytest-asyncio
+black
+flake8

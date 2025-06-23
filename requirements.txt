@@ -1,4 +1,17 @@
-Flask
-psycopg2-binary
+asyncpgAdd commentMore actions
+asyncio-compat
+mcp
+fastapi
+uvicorn[standard]
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
 python-dotenv
-gunicorn
+structlog
+httpx
+pydantic
+typing-extensions
+pytest
+pytest-asyncio
+black
+flake8Add comment

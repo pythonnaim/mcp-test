@@ -1,18 +1,34 @@
 # Core dependencies for PostgreSQL MCP Server
-asyncpg
-asyncio-compat
-mcp
-fastapi
-uvicorn[standard]
-python-jose[cryptography]
-passlib[bcrypt]
-python-multipart
-python-dotenv
-structlog
-httpx
-pydantic
-typing-extensions
-pytest
-pytest-asyncio
-black
-flake8
+asyncpg==0.29.0
+asyncio-compat==0.1.2
+
+# MCP (Model Context Protocol) framework
+mcp==1.0.0
+
+# Web server framework for HTTPS endpoint
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Authentication and security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+
+# Environment configuration
+python-dotenv==1.0.0
+
+# Logging and monitoring
+structlog==23.2.0
+
+# HTTP client for health checks
+httpx==0.25.2
+
+# Type hints and validation
+pydantic==2.5.0
+typing-extensions==4.8.0
+
+# Development and testing (optional)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+flake8==6.1.0

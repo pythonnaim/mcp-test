@@ -1,17 +1,3 @@
-asyncpgAdd commentMore actions
-asyncio-compat
-mcp
 fastapi
+asyncpg
 uvicorn[standard]
-python-jose[cryptography]
-passlib[bcrypt]
-python-multipart
-python-dotenv
-structlog
-httpx
-pydantic
-typing-extensions
-pytest
-pytest-asyncio
-black
-flake8Add comment

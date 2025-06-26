@@ -1,418 +1,512 @@
-# /// script
-# dependencies = ["asyncpg"]
-# ///
 
 """
-Simple MCP server for Claude with PostgreSQL database operations.
-No external API dependencies - works directly with Claude Desktop.
+Claude AI MCP Server for Multi-Database PostgreSQL
+Enables Claude to query multiple DigitalOcean PostgreSQL databases safely via MCP protocol.
 """
 
 import asyncio
 import json
+import logging
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import asyncpg
-from mcp.server.fastmcp import FastMCP
+import uvicorn
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
+from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
+from dotenv import load_dotenv
 
-# Create MCP server
-mcp = FastMCP(
-    "claude-postgres-server",
-    dependencies=["asyncpg"],
+# Load environment variables from .env file
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+@dataclass
+class DatabaseConfig:
+    """Configuration for a single database connection"""
+    name: str
+    host: str
+    port: int
+    database: str
+    username: str
+    password: str
+    ssl_mode: str = "require"
+    max_connections: int = 10
+    min_connections: int = 2
+    
+    @classmethod
+    def from_url(cls, name: str, url: str) -> 'DatabaseConfig':
+        """Create DatabaseConfig from PostgreSQL URL"""
+        parsed = urlparse(url)
+        
+        return cls(
+            name=name,
+            host=parsed.hostname,
+            port=parsed.port or 5432,
+            database=parsed.path.lstrip('/'),
+            username=parsed.username,
+            password=parsed.password,
+            ssl_mode="require"  # Always use SSL for DigitalOcean
+        )
+
+class MCPConfig:
+    """MCP Server configuration"""
+    def __init__(self):
+        self.bearer_token = os.getenv("MCP_BEARER_TOKEN", "your-secure-token-here")
+        self.max_query_time = int(os.getenv("MAX_QUERY_TIME", "30"))  # seconds
+        self.max_rows = int(os.getenv("MAX_ROWS", "1000"))
+        self.allowed_operations = set(os.getenv("ALLOWED_OPERATIONS", "SELECT").split(","))
+        self.databases = self._load_database_configs()
+    
+    def _load_database_configs(self) -> List[DatabaseConfig]:
+        """Load database configurations from environment variables"""
+        configs = []
+        
+        # Loop through all environment variables looking for POSTGRES_URL_* pattern
+        for key, value in os.environ.items():
+            if key.startswith("POSTGRES_URL_"):
+                # Extract database name from environment variable name
+                # POSTGRES_URL_DODB -> dodb
+                # POSTGRES_URL_BJB_INTAKES -> bjb_intakes
+                db_name = key.replace("POSTGRES_URL_", "").lower()
+                
+                try:
+                    config = DatabaseConfig.from_url(db_name, value)
+                    configs.append(config)
+                    logger.info(f"Loaded database config for: {db_name}")
+                except Exception as e:
+                    logger.error(f"Failed to parse database URL for {db_name}: {e}")
+                    continue
+        
+        if not configs:
+            logger.warning("No POSTGRES_URL_* environment variables found!")
+            # Create a sample config to prevent startup errors
+            configs.append(DatabaseConfig(
+                name="example_db",
+                host="localhost",
+                port=5432,
+                database="postgres",
+                username="postgres",
+                password="password"
+            ))
+        
+        logger.info(f"Loaded {len(configs)} database configurations")
+        return configs
+
+# Global configuration
+config = MCPConfig()
+
+# Database Connection Pool Manager
+class DatabaseManager:
+    """Manages multiple database connection pools"""
+    
+    def __init__(self, db_configs: List[DatabaseConfig]):
+        self.db_configs = {db.name: db for db in db_configs}
+        self.pools: Dict[str, asyncpg.Pool] = {}
+    
+    async def initialize(self):
+        """Initialize all database connection pools"""
+        for db_name, db_config in self.db_configs.items():
+            try:
+                dsn = f"postgresql://{db_config.username}:{db_config.password}@{db_config.host}:{db_config.port}/{db_config.database}?sslmode={db_config.ssl_mode}"
+                
+                pool = await asyncpg.create_pool(
+                    dsn,
+                    min_size=db_config.min_connections,
+                    max_size=db_config.max_connections,
+                    command_timeout=config.max_query_time
+                )
+                
+                self.pools[db_name] = pool
+                logger.info(f"Initialized connection pool for database: {db_name}")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize database {db_name}: {e}")
+                raise
+    
+    async def close(self):
+        """Close all database connection pools"""
+        for db_name, pool in self.pools.items():
+            await pool.close()
+            logger.info(f"Closed connection pool for database: {db_name}")
+    
+    def get_pool(self, db_name: str) -> asyncpg.Pool:
+        """Get connection pool for a specific database"""
+        if db_name not in self.pools:
+            raise ValueError(f"Database '{db_name}' not configured")
+        return self.pools[db_name]
+    
+    def list_databases(self) -> List[str]:
+        """List all configured database names"""
+        return list(self.pools.keys())
+
+# Global database manager
+db_manager = DatabaseManager(config.databases)
+
+# Pydantic models for API
+class QueryRequest(BaseModel):
+    database: str = Field(..., description="Database name to query")
+    query: str = Field(..., description="SQL query to execute", max_length=10000)
+    parameters: Optional[List[Any]] = Field(default=None, description="Query parameters")
+
+class QueryResult(BaseModel):
+    success: bool
+    data: Optional[List[Dict[str, Any]]] = None
+    columns: Optional[List[str]] = None
+    row_count: Optional[int] = None
+    execution_time: Optional[float] = None
+    error: Optional[str] = None
+
+class SchemaInfo(BaseModel):
+    database: str
+    tables: List[Dict[str, Any]]
+
+class MCPToolCall(BaseModel):
+    name: str
+    arguments: Dict[str, Any]
+
+class MCPResponse(BaseModel):
+    content: List[Dict[str, Any]]
+    isError: Optional[bool] = False
+
+# Security
+security = HTTPBearer()
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify Bearer token"""
+    if credentials.credentials != config.bearer_token:
+        raise HTTPException(
+            status_code=HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token"
+        )
+    return credentials
+
+# Query Safety Checks
+class QueryValidator:
+    """Validates SQL queries for safety"""
+    
+    DANGEROUS_KEYWORDS = {
+        'DELETE', 'DROP', 'TRUNCATE', 'ALTER', 'CREATE', 'INSERT', 'UPDATE',
+        'GRANT', 'REVOKE', 'EXECUTE', 'CALL', 'DECLARE', 'EXEC'
+    }
+    
+    @classmethod
+    def is_query_safe(cls, query: str, allowed_operations: set) -> Tuple[bool, str]:
+        """Check if query is safe to execute"""
+        query_upper = query.upper().strip()
+        
+        # Check for dangerous keywords
+        for keyword in cls.DANGEROUS_KEYWORDS:
+            if keyword not in allowed_operations and keyword in query_upper:
+                return False, f"Operation '{keyword}' is not allowed"
+        
+        # Check for common SQL injection patterns
+        suspicious_patterns = [
+            ';--', '/*', '*/', 'xp_', 'sp_', 'UNION SELECT', 'OR 1=1', "' OR '1'='1"
+        ]
+        
+        for pattern in suspicious_patterns:
+            if pattern.upper() in query_upper:
+                return False, f"Potentially dangerous pattern detected: {pattern}"
+        
+        return True, "Query appears safe"
+
+# Database Operations
+class DatabaseOperations:
+    """Database operation handlers"""
+    
+    @staticmethod
+    async def execute_query(
+        db_name: str, 
+        query: str, 
+        parameters: Optional[List[Any]] = None
+    ) -> QueryResult:
+        """Execute a SQL query safely"""
+        start_time = time.time()
+        
+        try:
+            # Validate query
+            is_safe, safety_message = QueryValidator.is_query_safe(query, config.allowed_operations)
+            if not is_safe:
+                return QueryResult(success=False, error=f"Query rejected: {safety_message}")
+            
+            # Get database pool
+            pool = db_manager.get_pool(db_name)
+            
+            async with pool.acquire() as conn:
+                # Set query timeout
+                await conn.execute(f"SET statement_timeout = '{config.max_query_time}s'")
+                
+                # Execute query
+                if parameters:
+                    rows = await conn.fetch(query, *parameters)
+                else:
+                    rows = await conn.fetch(query)
+                
+                # Limit rows
+                if len(rows) > config.max_rows:
+                    rows = rows[:config.max_rows]
+                    logger.warning(f"Query returned more than {config.max_rows} rows, truncated")
+                
+                # Convert to dict format
+                columns = list(rows[0].keys()) if rows else []
+                data = [dict(row) for row in rows]
+                
+                execution_time = time.time() - start_time
+                
+                logger.info(f"Query executed successfully on {db_name}: {len(data)} rows in {execution_time:.2f}s")
+                
+                return QueryResult(
+                    success=True,
+                    data=data,
+                    columns=columns,
+                    row_count=len(data),
+                    execution_time=execution_time
+                )
+                
+        except asyncio.TimeoutError:
+            return QueryResult(success=False, error="Query timeout exceeded")
+        except Exception as e:
+            logger.error(f"Query execution failed: {e}")
+            return QueryResult(success=False, error=str(e))
+    
+    @staticmethod
+    async def get_schema_info(db_name: str) -> SchemaInfo:
+        """Get database schema information"""
+        schema_query = """
+        SELECT 
+            t.table_name,
+            t.table_type,
+            array_agg(
+                json_build_object(
+                    'column_name', c.column_name,
+                    'data_type', c.data_type,
+                    'is_nullable', c.is_nullable,
+                    'column_default', c.column_default
+                ) ORDER BY c.ordinal_position
+            ) as columns
+        FROM information_schema.tables t
+        LEFT JOIN information_schema.columns c ON t.table_name = c.table_name
+        WHERE t.table_schema = 'public'
+        GROUP BY t.table_name, t.table_type
+        ORDER BY t.table_name;
+        """
+        
+        try:
+            result = await DatabaseOperations.execute_query(db_name, schema_query)
+            if result.success:
+                return SchemaInfo(database=db_name, tables=result.data or [])
+            else:
+                raise Exception(result.error)
+        except Exception as e:
+            logger.error(f"Failed to get schema info for {db_name}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to get schema info: {e}")
+
+# FastAPI Application
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager"""
+    # Startup
+    await db_manager.initialize()
+    logger.info("MCP Server started successfully")
+    yield
+    # Shutdown
+    await db_manager.close()
+    logger.info("MCP Server shutdown complete")
+
+app = FastAPI(
+    title="Claude AI MCP PostgreSQL Server",
+    description="Multi-database PostgreSQL MCP server for Claude AI",
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-# Your DigitalOcean PostgreSQL connection
-DB_DSN = os.getenv("POSTGRES_DSN")
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# API Routes
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "service": "Claude AI MCP PostgreSQL Server",
+        "status": "healthy",
+        "databases": db_manager.list_databases(),
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
-async def get_db_connection():
-    """Get a database connection"""
+@app.get("/databases")
+async def list_databases(credentials: HTTPAuthorizationCredentials = Depends(verify_token)):
+    """List all configured databases"""
+    return {"databases": db_manager.list_databases()}
+
+@app.get("/schema/{db_name}")
+async def get_database_schema(
+    db_name: str,
+    credentials: HTTPAuthorizationCredentials = Depends(verify_token)
+):
+    """Get schema information for a specific database"""
+    return await DatabaseOperations.get_schema_info(db_name)
+
+@app.post("/query")
+async def execute_query(
+    request: QueryRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(verify_token)
+):
+    """Execute a SQL query"""
+    return await DatabaseOperations.execute_query(
+        request.database,
+        request.query,
+        request.parameters
+    )
+
+# MCP Protocol Endpoints
+@app.post("/mcp/tools/call")
+async def mcp_tool_call(
+    tool_call: MCPToolCall,
+    credentials: HTTPAuthorizationCredentials = Depends(verify_token)
+):
+    """Handle MCP tool calls from Claude"""
     try:
-        return await asyncpg.connect(DB_DSN)
-    except Exception as e:
-        raise Exception(f"Database connection failed: {str(e)}")
-
-
-@mcp.tool()
-async def create_table(table_name: str, columns: str) -> str:
-    """
-    Create a new table in the database.
-    
-    Args:
-        table_name: Name of the table to create
-        columns: Column definitions (e.g., "id SERIAL PRIMARY KEY, name TEXT, age INTEGER")
-    """
-    try:
-        conn = await get_db_connection()
-        try:
-            query = f"CREATE TABLE IF NOT EXISTS {table_name} ({columns})"
-            await conn.execute(query)
-            return f"Table '{table_name}' created successfully"
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error creating table: {str(e)}"
-
-
-@mcp.tool()
-async def insert_data(table_name: str, data: Dict[str, Any]) -> str:
-    """
-    Insert data into a table.
-    
-    Args:
-        table_name: Name of the table
-        data: Dictionary of column names and values to insert
-    """
-    try:
-        conn = await get_db_connection()
-        try:
-            columns = list(data.keys())
-            values = list(data.values())
-            placeholders = ", ".join([f"${i+1}" for i in range(len(values))])
+        if tool_call.name == "fetch_data":
+            # Handle data fetching
+            db_name = tool_call.arguments.get("database")
+            query = tool_call.arguments.get("query")
             
-            query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
-            await conn.execute(query, *values)
-            return f"Data inserted into '{table_name}' successfully"
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error inserting data: {str(e)}"
-
-
-@mcp.tool()
-async def query_data(table_name: str, where_clause: Optional[str] = None, limit: int = 100) -> str:
-    """
-    Query data from a table.
-    
-    Args:
-        table_name: Name of the table to query
-        where_clause: Optional WHERE clause (e.g., "age > 18")
-        limit: Maximum number of rows to return (default: 100)
-    """
-    try:
-        conn = await get_db_connection()
-        try:
-            query = f"SELECT * FROM {table_name}"
-            if where_clause:
-                query += f" WHERE {where_clause}"
-            query += f" LIMIT {limit}"
-            
-            rows = await conn.fetch(query)
-            
-            if not rows:
-                return f"No data found in table '{table_name}'"
-            
-            # Convert rows to readable format
-            result = []
-            for row in rows:
-                result.append(dict(row))
-            
-            return json.dumps(result, indent=2, default=str)
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error querying data: {str(e)}"
-
-
-@mcp.tool()
-async def update_data(table_name: str, set_clause: str, where_clause: str) -> str:
-    """
-    Update data in a table.
-    
-    Args:
-        table_name: Name of the table
-        set_clause: SET clause (e.g., "name = 'John', age = 25")
-        where_clause: WHERE clause (e.g., "id = 1")
-    """
-    try:
-        conn = await get_db_connection()
-        try:
-            query = f"UPDATE {table_name} SET {set_clause} WHERE {where_clause}"
-            result = await conn.execute(query)
-            return f"Updated {result.split()[-1]} row(s) in '{table_name}'"
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error updating data: {str(e)}"
-
-
-@mcp.tool()
-async def delete_data(table_name: str, where_clause: str) -> str:
-    """
-    Delete data from a table.
-    
-    Args:
-        table_name: Name of the table
-        where_clause: WHERE clause (e.g., "id = 1")
-    """
-    try:
-        conn = await get_db_connection()
-        try:
-            query = f"DELETE FROM {table_name} WHERE {where_clause}"
-            result = await conn.execute(query)
-            return f"Deleted {result.split()[-1]} row(s) from '{table_name}'"
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error deleting data: {str(e)}"
-
-
-@mcp.tool()
-async def list_tables() -> str:
-    """List all tables in the database"""
-    try:
-        conn = await get_db_connection()
-        try:
-            query = """
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public'
-            ORDER BY table_name
-            """
-            rows = await conn.fetch(query)
-            
-            if not rows:
-                return "No tables found in database"
-            
-            tables = [row['table_name'] for row in rows]
-            return "Tables in database:\n" + "\n".join(f"- {table}" for table in tables)
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error listing tables: {str(e)}"
-
-
-@mcp.tool()
-async def describe_table(table_name: str) -> str:
-    """Get the structure of a table"""
-    try:
-        conn = await get_db_connection()
-        try:
-            query = """
-            SELECT column_name, data_type, is_nullable, column_default
-            FROM information_schema.columns 
-            WHERE table_name = $1 AND table_schema = 'public'
-            ORDER BY ordinal_position
-            """
-            rows = await conn.fetch(query, table_name)
-            
-            if not rows:
-                return f"Table '{table_name}' not found"
-            
-            result = f"Structure of table '{table_name}':\n"
-            for row in rows:
-                nullable = "NULL" if row['is_nullable'] == 'YES' else "NOT NULL"
-                default = f" DEFAULT {row['column_default']}" if row['column_default'] else ""
-                result += f"- {row['column_name']}: {row['data_type']} {nullable}{default}\n"
-            
-            return result
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error describing table: {str(e)}"
-
-
-@mcp.tool()
-async def execute_custom_query(sql_query: str) -> str:
-    """
-    Execute a custom SQL query (READ-ONLY for safety).
-    
-    Args:
-        sql_query: The SQL query to execute (SELECT statements only)
-    """
-    try:
-        # Basic safety check - only allow SELECT statements
-        query_upper = sql_query.strip().upper()
-        if not query_upper.startswith('SELECT'):
-            return "Error: Only SELECT queries are allowed for safety"
-        
-        conn = await get_db_connection()
-        try:
-            rows = await conn.fetch(sql_query)
-            
-            if not rows:
-                return "Query executed successfully - no results returned"
-            
-            result = []
-            for row in rows:
-                result.append(dict(row))
-            
-            return json.dumps(result, indent=2, default=str)
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error executing query: {str(e)}"
-
-
-@mcp.tool()
-async def store_note(title: str, content: str, tags: Optional[str] = None) -> str:
-    """
-    Store a note in the database.
-    
-    Args:
-        title: Title of the note
-        content: Content of the note
-        tags: Optional comma-separated tags
-    """
-    try:
-        conn = await get_db_connection()
-        try:
-            # Create notes table if it doesn't exist
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS notes (
-                    id SERIAL PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    tags TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            if not db_name or not query:
+                return MCPResponse(
+                    content=[{"type": "text", "text": "Missing required parameters: database and query"}],
+                    isError=True
                 )
-            """)
             
-            # Insert the note
-            await conn.execute(
-                "INSERT INTO notes (title, content, tags) VALUES ($1, $2, $3)",
-                title, content, tags
-            )
-            return f"Note '{title}' stored successfully"
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error storing note: {str(e)}"
-
-
-@mcp.tool()
-async def search_notes(search_term: str) -> str:
-    """
-    Search for notes by title or content.
-    
-    Args:
-        search_term: Term to search for in title or content
-    """
-    try:
-        conn = await get_db_connection()
-        try:
-            query = """
-            SELECT id, title, content, tags, created_at 
-            FROM notes 
-            WHERE title ILIKE $1 OR content ILIKE $1
-            ORDER BY created_at DESC
-            LIMIT 20
-            """
-            rows = await conn.fetch(query, f"%{search_term}%")
+            result = await DatabaseOperations.execute_query(db_name, query)
             
-            if not rows:
-                return f"No notes found containing '{search_term}'"
-            
-            result = f"Found {len(rows)} note(s) containing '{search_term}':\n\n"
-            for row in rows:
-                result += f"ID: {row['id']}\n"
-                result += f"Title: {row['title']}\n"
-                result += f"Content: {row['content'][:200]}{'...' if len(row['content']) > 200 else ''}\n"
-                if row['tags']:
-                    result += f"Tags: {row['tags']}\n"
-                result += f"Created: {row['created_at']}\n"
-                result += "-" * 50 + "\n"
-            
-            return result
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error searching notes: {str(e)}"
-
-
-@mcp.resource("database://tables")
-async def get_database_info() -> str:
-    """Get information about all database tables"""
-    try:
-        conn = await get_db_connection()
-        try:
-            # Get table list with row counts
-            query = """
-            SELECT 
-                schemaname as schema,
-                tablename as table_name,
-                hasindexes as has_indexes,
-                hasrules as has_rules,
-                hastriggers as has_triggers
-            FROM pg_tables 
-            WHERE schemaname = 'public'
-            ORDER BY tablename
-            """
-            rows = await conn.fetch(query)
-            
-            result = "Database Information:\n\n"
-            for row in rows:
-                result += f"Table: {row['table_name']}\n"
+            if result.success:
+                # Format response for Claude
+                response_text = f"Query executed successfully on {db_name}:\n"
+                response_text += f"Returned {result.row_count} rows in {result.execution_time:.2f} seconds\n\n"
                 
-                # Get row count
-                count_result = await conn.fetchval(f"SELECT COUNT(*) FROM {row['table_name']}")
-                result += f"  Rows: {count_result}\n"
-                result += f"  Has Indexes: {row['has_indexes']}\n"
-                result += f"  Has Rules: {row['has_rules']}\n"
-                result += f"  Has Triggers: {row['has_triggers']}\n\n"
-            
-            return result
-        finally:
-            await conn.close()
-    except Exception as e:
-        return f"Error getting database info: {str(e)}"
-
-
-async def initialize_database():
-    """Test database connection and create sample table"""
-    try:
-        print("Testing database connection...")
-        conn = await get_db_connection()
-        try:
-            # Test connection
-            result = await conn.fetchval("SELECT version()")
-            print(f"✅ Connected to PostgreSQL: {result}")
-            
-            # Create a sample table for demonstration
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS mcp_test (
-                    id SERIAL PRIMARY KEY,
-                    message TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                if result.data:
+                    # Convert to readable format
+                    response_text += "Results:\n"
+                    for i, row in enumerate(result.data[:10]):  # Show first 10 rows
+                        response_text += f"Row {i+1}: {row}\n"
+                    
+                    if result.row_count > 10:
+                        response_text += f"... and {result.row_count - 10} more rows\n"
+                
+                return MCPResponse(content=[{"type": "text", "text": response_text}])
+            else:
+                return MCPResponse(
+                    content=[{"type": "text", "text": f"Query failed: {result.error}"}],
+                    isError=True
                 )
-            """)
-            print("✅ Sample table 'mcp_test' created")
+        
+        elif tool_call.name == "get_schema":
+            # Handle schema requests
+            db_name = tool_call.arguments.get("database")
             
-            return True
-        finally:
-            await conn.close()
-    except Exception as e:
-        print(f"❌ Database connection failed: {e}")
-        return False
-
-
-def main():
-    """Initialize and start the MCP server"""
-    print("🚀 Starting Claude MCP Server...")
-    
-    # Test database connection first
-    async def init_db():
-        return await initialize_database()
-    
-    try:
-        db_success = asyncio.run(init_db())
-        if not db_success:
-            print("⚠️  Warning: Database not available. Server will start but database tools won't work.")
+            if not db_name:
+                return MCPResponse(
+                    content=[{"type": "text", "text": "Missing required parameter: database"}],
+                    isError=True
+                )
+            
+            schema_info = await DatabaseOperations.get_schema_info(db_name)
+            
+            response_text = f"Schema for database '{db_name}':\n\n"
+            for table in schema_info.tables:
+                response_text += f"Table: {table['table_name']} ({table['table_type']})\n"
+                for column in table['columns']:
+                    response_text += f"  - {column['column_name']}: {column['data_type']}"
+                    if column['is_nullable'] == 'NO':
+                        response_text += " (NOT NULL)"
+                    response_text += "\n"
+                response_text += "\n"
+            
+            return MCPResponse(content=[{"type": "text", "text": response_text}])
+        
         else:
-            print("✅ Database ready!")
+            return MCPResponse(
+                content=[{"type": "text", "text": f"Unknown tool: {tool_call.name}"}],
+                isError=True
+            )
+    
     except Exception as e:
-        print(f"⚠️  Database initialization failed: {e}")
-        print("Server will start but database tools won't work.")
-    
-    print("🔌 Starting MCP server for Claude...")
-    print("📝 Available tools: create_table, insert_data, query_data, update_data, delete_data, list_tables, describe_table, execute_custom_query, store_note, search_notes")
-    print("📚 Available resources: database://tables")
-    
-    # Start the MCP server (this handles its own event loop)
-    mcp.run()
+        logger.error(f"MCP tool call failed: {e}")
+        return MCPResponse(
+            content=[{"type": "text", "text": f"Internal error: {str(e)}"}],
+            isError=True
+        )
 
+@app.get("/mcp/tools")
+async def mcp_list_tools(credentials: HTTPAuthorizationCredentials = Depends(verify_token)):
+    """List available MCP tools for Claude"""
+    return {
+        "tools": [
+            {
+                "name": "fetch_data",
+                "description": "Execute SQL queries against configured databases",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "database": {
+                            "type": "string",
+                            "description": "Database name to query",
+                            "enum": db_manager.list_databases()
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "SQL query to execute"
+                        }
+                    },
+                    "required": ["database", "query"]
+                }
+            },
+            {
+                "name": "get_schema",
+                "description": "Get database schema information",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "database": {
+                            "type": "string",
+                            "description": "Database name",
+                            "enum": db_manager.list_databases()
+                        }
+                    },
+                    "required": ["database"]
+                }
+            }
+        ]
+    }
 
+# Main entry point
 if __name__ == "__main__":
-    main()
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8080,
+        reload=False,
+        log_level="info"
+    )

@@ -1,3 +1,4 @@
 fastapi
 asyncpg
 uvicorn[standard]
+mcp

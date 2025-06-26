@@ -1,4 +1,11 @@
+# requirements.txt
 fastapi
-asyncpg
 uvicorn[standard]
-mcp
+asyncpg
+pydantic
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+httpx
+aiofiles
+python-dotenv

@@ -390,7 +390,7 @@ async def initialize_database():
 
 def main():
     """Initialize and start the MCP server"""
-    print("🚀 Starting Claude MCP Server...")
+    print("🚀 Starting Claude MCP Server on Render...")
     
     # Test database connection first
     async def init_db():
@@ -406,12 +406,12 @@ def main():
         print(f"⚠️  Database initialization failed: {e}")
         print("Server will start but database tools won't work.")
     
-    print("🔌 Starting MCP server for Claude...")
+    print(f"🔌 Starting MCP server on port {port}...")
     print("📝 Available tools: create_table, insert_data, query_data, update_data, delete_data, list_tables, describe_table, execute_custom_query, store_note, search_notes")
     print("📚 Available resources: database://tables")
     
-    # Start the MCP server (this handles its own event loop)
-    mcp.run()
+    # Start the MCP server with port binding for Render
+    mcp.run(port=8080, host="0.0.0.0")
 
 
 if __name__ == "__main__":

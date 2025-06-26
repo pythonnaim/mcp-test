@@ -406,7 +406,6 @@ def main():
         print(f"⚠️  Database initialization failed: {e}")
         print("Server will start but database tools won't work.")
     
-    print(f"🔌 Starting MCP server on port {port}...")
     print("📝 Available tools: create_table, insert_data, query_data, update_data, delete_data, list_tables, describe_table, execute_custom_query, store_note, search_notes")
     print("📚 Available resources: database://tables")
     

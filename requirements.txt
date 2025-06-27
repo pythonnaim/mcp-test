@@ -1,11 +1,15 @@
-# requirements.txt
-fastapi
-uvicorn[standard]
+# Core MCP dependencies
+mcp
+fastmcp
+
+# PostgreSQL driver
 asyncpg
-pydantic
-python-multipart
-python-jose[cryptography]
-passlib[bcrypt]
-httpx
-aiofiles
+
+# Web server
+uvicorn
+
+# Environment variables (optional)
 python-dotenv
+
+# Additional utilities
+pydantic

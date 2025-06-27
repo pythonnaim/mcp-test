@@ -1,390 +1,473 @@
 
 """
-Claude-Compatible PostgreSQL Web API Server for Render
-Hosts your PostgreSQL databases as a web API that Claude can access
+Multi-Database PostgreSQL MCP Server
+A comprehensive MCP server that provides secure access to multiple PostgreSQL databases
+with schema discovery, query execution, and safety controls.
 """
 
-import asyncio
-import json
-import logging
 import os
-import time
-from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import asyncio
+import logging
+from typing import Dict, List, Optional, Any, Union
 from urllib.parse import urlparse
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+import json
+import re
 
 import asyncpg
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.types import Resource, Tool
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, Request, Header
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
-from starlette.status import HTTP_401_UNAUTHORIZED
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+@dataclass
 class DatabaseConfig:
-    """Database configuration from URL"""
-    def __init__(self, name: str, url: str):
-        self.name = name
-        self.url = url
-        parsed = urlparse(url)
-        self.host = parsed.hostname
-        self.port = parsed.port or 5432
-        self.database = parsed.path.lstrip('/')
-        self.username = parsed.username
-        self.password = parsed.password
+    """Configuration for a database connection"""
+    name: str
+    url: str
+    description: str = ""
+    
+@dataclass
+class AppContext:
+    """Application context containing database connections"""
+    db_pools: Dict[str, asyncpg.Pool]
+    db_configs: Dict[str, DatabaseConfig]
 
-class DatabaseManager:
-    """Manages multiple database connection pools"""
+class PostgreSQLMCPServer:
+    """Multi-database PostgreSQL MCP Server"""
     
     def __init__(self):
-        self.databases = self._load_database_configs()
-        self.pools: Dict[str, asyncpg.Pool] = {}
-        self.max_query_time = int(os.getenv("MAX_QUERY_TIME", "30"))
-        self.max_rows = int(os.getenv("MAX_ROWS", "1000"))
-        self.allowed_operations = set(os.getenv("ALLOWED_OPERATIONS", "SELECT").split(","))
-    
-    def _load_database_configs(self) -> List[DatabaseConfig]:
+        self.app = FastMCP("PostgreSQL Multi-Database Server")
+        self.setup_routes()
+        
+    def load_database_configs(self) -> Dict[str, DatabaseConfig]:
         """Load database configurations from environment variables"""
-        configs = []
+        configs = {}
         
-        for key, value in os.environ.items():
-            if key.startswith("POSTGRES_URL_"):
-                db_name = key.replace("POSTGRES_URL_", "").lower()
-                try:
-                    config = DatabaseConfig(db_name, value)
-                    configs.append(config)
-                    logger.info(f"Loaded database config: {db_name}")
-                except Exception as e:
-                    logger.error(f"Failed to parse database URL for {db_name}: {e}")
+        # Define your database mappings
+        db_mappings = {
+            'POSTGRES_URL__DODB': 'dodb',
+            'POSTGRES_URL_BJB_INTAKES': 'bjb_intakes', 
+            'POSTGRES_URL_BJB_TABLEAU': 'bjb_tableau',
+            'POSTGRES_URL_COLGATE': 'colgate',
+            'POSTGRES_URL_COLGATE_SANDBOX': 'colgate_sandbox',
+            'POSTGRES_URL_CORTEVA': 'corteva',
+            'POSTGRES_URL_ELIDA': 'elida',
+            'POSTGRES_URL_JNJ': 'jnj',
+            'POSTGRES_URL_ROC': 'roc',
+            'POSTGRES_URL_SBAITI': 'sbaiti',
+            'POSTGRES_URL_SBAITI_CODE': 'sbaiti_code',
+            'POSTGRES_URL_SCHOOLSTATUS': 'schoolstatus',
+            'POSTGRES_URL_SCHOOLSTATUS_CODE': 'schoolstatus_code',
+            'POSTGRES_URL_SS_ANALYTICS': 'ss_analytics',
+            'POSTGRES_URL_TMS': 'tms'
+        }
         
-        if not configs:
-            logger.error("No POSTGRES_URL_* environment variables found!")
-            raise ValueError("No database configurations found")
-        
-        return configs
-    
-    async def initialize(self):
-        """Initialize database connection pools"""
-        for db_config in self.databases:
-            try:
-                pool = await asyncpg.create_pool(
-                    db_config.url,
-                    min_size=2,
-                    max_size=10,
-                    command_timeout=self.max_query_time
+        for env_var, db_name in db_mappings.items():
+            url = os.getenv(env_var)
+            if url:
+                # Parse URL to get database name for description
+                parsed = urlparse(url)
+                db_display_name = parsed.path.lstrip('/') if parsed.path else db_name
+                
+                configs[db_name] = DatabaseConfig(
+                    name=db_name,
+                    url=url,
+                    description=f"Database: {db_display_name}"
                 )
-                self.pools[db_config.name] = pool
-                logger.info(f"Initialized pool for database: {db_config.name}")
-            except Exception as e:
-                logger.error(f"Failed to initialize pool for {db_config.name}: {e}")
-                raise
-    
-    async def close(self):
-        """Close all database pools"""
-        for name, pool in self.pools.items():
-            await pool.close()
-            logger.info(f"Closed pool for database: {name}")
-    
-    def get_pool(self, db_name: str) -> asyncpg.Pool:
-        """Get connection pool for a specific database"""
-        if db_name not in self.pools:
-            raise ValueError(f"Database '{db_name}' not configured")
-        return self.pools[db_name]
-    
-    def list_databases(self) -> List[str]:
-        """List all configured database names"""
-        return list(self.pools.keys())
-    
-    def _is_query_safe(self, query: str) -> tuple[bool, str]:
-        """Check if query is safe to execute"""
-        query_upper = query.upper().strip()
-        
-        # Check for dangerous keywords
-        dangerous_keywords = {
-            'DELETE', 'DROP', 'TRUNCATE', 'ALTER', 'CREATE', 'INSERT', 'UPDATE',
-            'GRANT', 'REVOKE', 'EXECUTE', 'CALL', 'DECLARE', 'EXEC'
-        }
-        
-        for keyword in dangerous_keywords:
-            if keyword not in self.allowed_operations and keyword in query_upper:
-                return False, f"Operation '{keyword}' is not allowed"
-        
-        # Check for suspicious patterns
-        suspicious_patterns = [';--', '/*', '*/', 'UNION SELECT', 'OR 1=1']
-        for pattern in suspicious_patterns:
-            if pattern.upper() in query_upper:
-                return False, f"Potentially dangerous pattern detected: {pattern}"
-        
-        return True, "Query appears safe"
-    
-    async def execute_query(self, db_name: str, query: str) -> Dict[str, Any]:
-        """Execute a SQL query safely"""
-        start_time = time.time()
-        
-        try:
-            # Validate query
-            is_safe, safety_message = self._is_query_safe(query)
-            if not is_safe:
-                return {
-                    "success": False,
-                    "error": f"Query rejected: {safety_message}",
-                    "data": None
-                }
-            
-            # Get database pool
-            pool = self.get_pool(db_name)
-            
-            async with pool.acquire() as conn:
-                # Set query timeout
-                await conn.execute(f"SET statement_timeout = '{self.max_query_time}s'")
-                
-                # Execute query
-                rows = await conn.fetch(query)
-                
-                # Limit rows
-                if len(rows) > self.max_rows:
-                    rows = rows[:self.max_rows]
-                    logger.warning(f"Query returned more than {self.max_rows} rows, truncated")
-                
-                # Convert to dict format
-                columns = list(rows[0].keys()) if rows else []
-                data = [dict(row) for row in rows]
-                
-                execution_time = time.time() - start_time
-                
-                logger.info(f"Query executed successfully on {db_name}: {len(data)} rows in {execution_time:.2f}s")
-                
-                return {
-                    "success": True,
-                    "data": data,
-                    "columns": columns,
-                    "row_count": len(data),
-                    "execution_time": execution_time,
-                    "database": db_name,
-                    "query": query[:100] + "..." if len(query) > 100 else query
-                }
-                
-        except asyncio.TimeoutError:
-            return {"success": False, "error": "Query timeout exceeded", "data": None}
-        except Exception as e:
-            logger.error(f"Query execution failed: {e}")
-            return {"success": False, "error": str(e), "data": None}
-    
-    async def get_schema_info(self, db_name: str) -> Dict[str, Any]:
-        """Get database schema information"""
-        schema_query = """
-        SELECT 
-            t.table_name,
-            t.table_type,
-            array_agg(
-                json_build_object(
-                    'column_name', c.column_name,
-                    'data_type', c.data_type,
-                    'is_nullable', c.is_nullable,
-                    'column_default', c.column_default
-                ) ORDER BY c.ordinal_position
-            ) as columns
-        FROM information_schema.tables t
-        LEFT JOIN information_schema.columns c ON t.table_name = c.table_name
-        WHERE t.table_schema = 'public'
-        GROUP BY t.table_name, t.table_type
-        ORDER BY t.table_name;
-        """
-        
-        try:
-            result = await self.execute_query(db_name, schema_query)
-            if result["success"]:
-                return {
-                    "success": True,
-                    "database": db_name,
-                    "tables": result["data"] or []
-                }
+                logger.info(f"Loaded configuration for database: {db_name}")
             else:
-                return {
-                    "success": False,
-                    "error": result["error"],
-                    "database": db_name
-                }
-        except Exception as e:
-            logger.error(f"Failed to get schema info for {db_name}: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "database": db_name
-            }
+                logger.warning(f"Environment variable {env_var} not found")
+                
+        return configs
 
-# Global database manager
-db_manager = DatabaseManager()
-
-# Pydantic models
-class QueryRequest(BaseModel):
-    database: str = Field(..., description="Database name to query")
-    query: str = Field(..., description="SQL query to execute", max_length=10000)
-
-class ClaudeRequest(BaseModel):
-    message: str = Field(..., description="Natural language request")
-    database: Optional[str] = Field(None, description="Specific database to query (optional)")
-
-# Security
-security = HTTPBearer()
-API_KEY = os.getenv("API_KEY", "your-secure-api-key-change-this")
-
-async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify API key"""
-    if credentials.credentials != API_KEY:
-        raise HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key"
-        )
-    return credentials
-
-# FastAPI Application
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
-    # Startup
-    await db_manager.initialize()
-    logger.info("PostgreSQL API Server started successfully")
-    yield
-    # Shutdown
-    await db_manager.close()
-    logger.info("PostgreSQL API Server shutdown complete")
-
-app = FastAPI(
-    title="Claude PostgreSQL API Server",
-    description="Multi-database PostgreSQL API server for Claude AI",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# API Routes
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {
-        "service": "Claude PostgreSQL API Server",
-        "status": "healthy",
-        "databases": db_manager.list_databases(),
-        "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.0.0"
-    }
-
-@app.get("/health")
-async def health():
-    """Health check for Render"""
-    return {"status": "healthy"}
-
-@app.get("/databases")
-async def list_databases(credentials: HTTPAuthorizationCredentials = Depends(verify_api_key)):
-    """List all configured databases"""
-    return {
-        "databases": [
-            {
-                "name": db.name,
-                "database": db.database,
-                "host": db.host
-            } for db in db_manager.databases
-        ]
-    }
-
-@app.get("/schema/{db_name}")
-async def get_database_schema(
-    db_name: str,
-    credentials: HTTPAuthorizationCredentials = Depends(verify_api_key)
-):
-    """Get schema information for a specific database"""
-    return await db_manager.get_schema_info(db_name)
-
-@app.post("/query")
-async def execute_query(
-    request: QueryRequest,
-    credentials: HTTPAuthorizationCredentials = Depends(verify_api_key)
-):
-    """Execute a SQL query"""
-    return await db_manager.execute_query(request.database, request.query)
-
-@app.post("/claude")
-async def claude_endpoint(
-    request: ClaudeRequest,
-    credentials: HTTPAuthorizationCredentials = Depends(verify_api_key)
-):
-    """
-    Claude-friendly endpoint for natural language database queries
-    This endpoint helps Claude understand how to interact with your databases
-    """
-    message = request.message.lower()
-    
-    # Simple natural language processing
-    if "list" in message and "database" in message:
-        return {
-            "response": "Available databases: " + ", ".join(db_manager.list_databases()),
-            "type": "database_list"
-        }
-    
-    elif "schema" in message or "structure" in message or "tables" in message:
-        # Try to extract database name
-        db_name = request.database
-        if not db_name:
-            # Try to find database name in message
-            for db in db_manager.list_databases():
-                if db in message:
-                    db_name = db
-                    break
+    async def create_db_pools(self, configs: Dict[str, DatabaseConfig]) -> Dict[str, asyncpg.Pool]:
+        """Create connection pools for all databases"""
+        pools = {}
         
-        if db_name:
-            schema_info = await db_manager.get_schema_info(db_name)
-            return {
-                "response": f"Schema information for {db_name}",
-                "data": schema_info,
-                "type": "schema_info"
-            }
-        else:
-            return {
-                "response": "Please specify which database schema you want to see",
-                "available_databases": db_manager.list_databases(),
-                "type": "clarification_needed"
-            }
-    
-    else:
-        return {
-            "response": "I can help you with database operations. Try asking about:\n- List databases\n- Show schema for [database_name]\n- Or use the /query endpoint for direct SQL",
-            "available_endpoints": [
-                {"endpoint": "/databases", "description": "List all databases"},
-                {"endpoint": "/schema/{db_name}", "description": "Get database schema"},
-                {"endpoint": "/query", "description": "Execute SQL query"}
-            ],
-            "type": "help"
-        }
+        for db_name, config in configs.items():
+            try:
+                # Create connection pool with optimal settings
+                pool = await asyncpg.create_pool(
+                    config.url,
+                    min_size=1,
+                    max_size=10,
+                    max_queries=50000,
+                    max_inactive_connection_lifetime=300,
+                    command_timeout=30
+                )
+                pools[db_name] = pool
+                logger.info(f"Created connection pool for {db_name}")
+            except Exception as e:
+                logger.error(f"Failed to create pool for {db_name}: {str(e)}")
+                
+        return pools
 
-# Get port from environment variable (required for Render)
-port = int(os.getenv("PORT", 8000))
+    @asynccontextmanager
+    async def app_lifespan(self, server: FastMCP) -> AsyncIterator[AppContext]:
+        """Manage application lifecycle with database connections"""
+        logger.info("Starting PostgreSQL MCP Server...")
+        
+        # Load database configurations
+        db_configs = self.load_database_configs()
+        if not db_configs:
+            raise RuntimeError("No database configurations found. Please check your environment variables.")
+        
+        # Create connection pools
+        db_pools = await self.create_db_pools(db_configs)
+        if not db_pools:
+            raise RuntimeError("Failed to create any database connection pools.")
+        
+        logger.info(f"Initialized {len(db_pools)} database connections")
+        
+        try:
+            yield AppContext(db_pools=db_pools, db_configs=db_configs)
+        finally:
+            # Cleanup connections
+            logger.info("Shutting down database connections...")
+            for db_name, pool in db_pools.items():
+                try:
+                    await pool.close()
+                    logger.info(f"Closed connection pool for {db_name}")
+                except Exception as e:
+                    logger.error(f"Error closing pool for {db_name}: {str(e)}")
+
+    def validate_sql_query(self, query: str) -> bool:
+        """Validate SQL query for safety (basic validation)"""
+        query_lower = query.lower().strip()
+        
+        # Block dangerous operations
+        dangerous_patterns = [
+            r'\bdrop\s+table\b',
+            r'\bdrop\s+database\b', 
+            r'\bdelete\s+from\b',
+            r'\btruncate\b',
+            r'\balter\s+table\b',
+            r'\bcreate\s+table\b',
+            r'\binsert\s+into\b',
+            r'\bupdate\s+\w+\s+set\b',
+            r'\bgrant\b',
+            r'\brevoke\b',
+            r'\bdrop\s+user\b',
+            r'\bcreate\s+user\b'
+        ]
+        
+        for pattern in dangerous_patterns:
+            if re.search(pattern, query_lower):
+                return False
+                
+        return True
+
+    def setup_routes(self):
+        """Setup MCP server routes"""
+        
+        @self.app.resource("databases://list")
+        async def list_databases(ctx: Context) -> str:
+            """List all available databases"""
+            app_ctx: AppContext = ctx.app_context
+            
+            db_list = []
+            for db_name, config in app_ctx.db_configs.items():
+                status = "connected" if db_name in app_ctx.db_pools else "disconnected"
+                db_list.append({
+                    "name": db_name,
+                    "description": config.description,
+                    "status": status
+                })
+            
+            return json.dumps(db_list, indent=2)
+
+        @self.app.resource("schema://{database_name}")
+        async def get_database_schema(database_name: str, ctx: Context) -> str:
+            """Get schema information for a specific database"""
+            app_ctx: AppContext = ctx.app_context
+            
+            if database_name not in app_ctx.db_pools:
+                return f"Error: Database '{database_name}' not found or not connected"
+            
+            pool = app_ctx.db_pools[database_name]
+            
+            try:
+                async with pool.acquire() as conn:
+                    # Get all tables with their schemas
+                    tables_query = """
+                    SELECT 
+                        schemaname,
+                        tablename,
+                        tableowner
+                    FROM pg_tables 
+                    WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+                    ORDER BY schemaname, tablename;
+                    """
+                    
+                    tables = await conn.fetch(tables_query)
+                    
+                    schema_info = {
+                        "database": database_name,
+                        "schemas": {}
+                    }
+                    
+                    # Group tables by schema
+                    for table in tables:
+                        schema_name = table['schemaname']
+                        if schema_name not in schema_info["schemas"]:
+                            schema_info["schemas"][schema_name] = {"tables": []}
+                        
+                        # Get column information for each table
+                        columns_query = """
+                        SELECT 
+                            column_name,
+                            data_type,
+                            is_nullable,
+                            column_default
+                        FROM information_schema.columns
+                        WHERE table_schema = $1 AND table_name = $2
+                        ORDER BY ordinal_position;
+                        """
+                        
+                        columns = await conn.fetch(columns_query, schema_name, table['tablename'])
+                        
+                        table_info = {
+                            "name": table['tablename'],
+                            "owner": table['tableowner'],
+                            "columns": [
+                                {
+                                    "name": col['column_name'],
+                                    "type": col['data_type'],
+                                    "nullable": col['is_nullable'] == 'YES',
+                                    "default": col['column_default']
+                                }
+                                for col in columns
+                            ]
+                        }
+                        
+                        schema_info["schemas"][schema_name]["tables"].append(table_info)
+                
+                return json.dumps(schema_info, indent=2)
+                
+            except Exception as e:
+                logger.error(f"Error getting schema for {database_name}: {str(e)}")
+                return f"Error retrieving schema: {str(e)}"
+
+        @self.app.tool()
+        async def execute_query(
+            database_name: str,
+            query: str,
+            limit: int = 100,
+            ctx: Context = None
+        ) -> str:
+            """Execute a read-only SQL query on the specified database"""
+            app_ctx: AppContext = ctx.app_context
+            
+            if database_name not in app_ctx.db_pools:
+                return f"Error: Database '{database_name}' not found or not connected"
+            
+            # Validate query for safety
+            if not self.validate_sql_query(query):
+                return "Error: Query contains potentially dangerous operations. Only SELECT queries are allowed."
+            
+            # Ensure limit is reasonable
+            limit = min(limit, 1000)
+            
+            pool = app_ctx.db_pools[database_name]
+            
+            try:
+                async with pool.acquire() as conn:
+                    # Execute query with timeout
+                    rows = await asyncio.wait_for(
+                        conn.fetch(f"SELECT * FROM ({query}) AS subquery LIMIT {limit}"),
+                        timeout=30.0
+                    )
+                    
+                    if not rows:
+                        return "Query executed successfully. No results returned."
+                    
+                    # Convert to list of dictionaries
+                    results = []
+                    for row in rows:
+                        results.append(dict(row))
+                    
+                    return json.dumps({
+                        "database": database_name,
+                        "query": query,
+                        "row_count": len(results),
+                        "limit_applied": limit,
+                        "results": results
+                    }, indent=2, default=str)
+                    
+            except asyncio.TimeoutError:
+                return "Error: Query timed out (30 second limit)"
+            except Exception as e:
+                logger.error(f"Error executing query on {database_name}: {str(e)}")
+                return f"Error executing query: {str(e)}"
+
+        @self.app.tool()
+        async def explain_query(
+            database_name: str,
+            query: str,
+            ctx: Context = None
+        ) -> str:
+            """Get the execution plan for a query"""
+            app_ctx: AppContext = ctx.app_context
+            
+            if database_name not in app_ctx.db_pools:
+                return f"Error: Database '{database_name}' not found or not connected"
+            
+            # Validate query for safety
+            if not self.validate_sql_query(query):
+                return "Error: Query contains potentially dangerous operations. Only SELECT queries are allowed."
+            
+            pool = app_ctx.db_pools[database_name]
+            
+            try:
+                async with pool.acquire() as conn:
+                    # Get execution plan
+                    explain_query = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query}"
+                    result = await conn.fetchval(explain_query)
+                    
+                    return json.dumps({
+                        "database": database_name,
+                        "original_query": query,
+                        "execution_plan": result
+                    }, indent=2)
+                    
+            except Exception as e:
+                logger.error(f"Error explaining query on {database_name}: {str(e)}")
+                return f"Error getting execution plan: {str(e)}"
+
+        @self.app.tool()
+        async def get_table_sample(
+            database_name: str,
+            schema_name: str,
+            table_name: str,
+            sample_size: int = 10,
+            ctx: Context = None
+        ) -> str:
+            """Get a sample of data from a specific table"""
+            app_ctx: AppContext = ctx.app_context
+            
+            if database_name not in app_ctx.db_pools:
+                return f"Error: Database '{database_name}' not found or not connected"
+            
+            sample_size = min(sample_size, 100)  # Limit sample size
+            pool = app_ctx.db_pools[database_name]
+            
+            try:
+                async with pool.acquire() as conn:
+                    # Get table sample
+                    query = f"""
+                    SELECT * FROM "{schema_name}"."{table_name}"
+                    ORDER BY RANDOM()
+                    LIMIT {sample_size}
+                    """
+                    
+                    rows = await conn.fetch(query)
+                    
+                    if not rows:
+                        return f"Table {schema_name}.{table_name} is empty"
+                    
+                    # Convert to list of dictionaries
+                    results = []
+                    for row in rows:
+                        results.append(dict(row))
+                    
+                    return json.dumps({
+                        "database": database_name,
+                        "schema": schema_name,
+                        "table": table_name,
+                        "sample_size": len(results),
+                        "data": results
+                    }, indent=2, default=str)
+                    
+            except Exception as e:
+                logger.error(f"Error getting sample from {database_name}.{schema_name}.{table_name}: {str(e)}")
+                return f"Error getting table sample: {str(e)}"
+
+        @self.app.tool()
+        async def search_tables(
+            database_name: str,
+            search_term: str,
+            ctx: Context = None
+        ) -> str:
+            """Search for tables containing the search term in their name or columns"""
+            app_ctx: AppContext = ctx.app_context
+            
+            if database_name not in app_ctx.db_pools:
+                return f"Error: Database '{database_name}' not found or not connected"
+            
+            pool = app_ctx.db_pools[database_name]
+            
+            try:
+                async with pool.acquire() as conn:
+                    # Search in table names
+                    table_search_query = """
+                    SELECT 
+                        schemaname,
+                        tablename,
+                        'table_name' as match_type
+                    FROM pg_tables 
+                    WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+                    AND LOWER(tablename) LIKE LOWER($1)
+                    """
+                    
+                    # Search in column names
+                    column_search_query = """
+                    SELECT 
+                        table_schema as schemaname,
+                        table_name as tablename,
+                        column_name,
+                        'column_name' as match_type
+                    FROM information_schema.columns
+                    WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+                    AND LOWER(column_name) LIKE LOWER($1)
+                    """
+                    
+                    search_pattern = f"%{search_term}%"
+                    
+                    table_matches = await conn.fetch(table_search_query, search_pattern)
+                    column_matches = await conn.fetch(column_search_query, search_pattern)
+                    
+                    results = {
+                        "database": database_name,
+                        "search_term": search_term,
+                        "table_matches": [dict(match) for match in table_matches],
+                        "column_matches": [dict(match) for match in column_matches]
+                    }
+                    
+                    return json.dumps(results, indent=2)
+                    
+            except Exception as e:
+                logger.error(f"Error searching in {database_name}: {str(e)}")
+                return f"Error searching: {str(e)}"
+
+    def run(self, host: str = "127.0.0.1", port: int = 3000):
+        """Run the MCP server"""
+        # Set the lifespan
+        self.app._lifespan = self.app_lifespan
+        
+        logger.info(f"Starting PostgreSQL MCP Server on {host}:{port}")
+        logger.info("Available databases will be loaded from environment variables")
+        
+        # Run with FastMCP's built-in server
+        self.app.run(transport="http", host=host, port=port)
+
+def main():
+    """Main entry point"""
+    # Load environment variables from .env file if it exists
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+        logger.info("Loaded environment variables from .env file")
+    except ImportError:
+        logger.info("python-dotenv not installed, skipping .env file loading")
+    
+    server = PostgreSQLMCPServer()
+    server.run()
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-        log_level="info"
-    )
+    main()

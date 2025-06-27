@@ -1,15 +1,3 @@
-# Core MCP dependencies
-mcp
-fastmcp
-
-# PostgreSQL driver
 asyncpg
-
-# Web server
-uvicorn
-
-# Environment variables (optional)
+mcp
 python-dotenv
-
-# Additional utilities
-pydantic

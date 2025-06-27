@@ -51,21 +51,7 @@ class PostgreSQLMCPServer:
         
         # Define your database mappings
         db_mappings = {
-            'POSTGRES_URL__DODB': 'dodb',
-            'POSTGRES_URL_BJB_INTAKES': 'bjb_intakes', 
-            'POSTGRES_URL_BJB_TABLEAU': 'bjb_tableau',
-            'POSTGRES_URL_COLGATE': 'colgate',
-            'POSTGRES_URL_COLGATE_SANDBOX': 'colgate_sandbox',
-            'POSTGRES_URL_CORTEVA': 'corteva',
-            'POSTGRES_URL_ELIDA': 'elida',
-            'POSTGRES_URL_JNJ': 'jnj',
-            'POSTGRES_URL_ROC': 'roc',
-            'POSTGRES_URL_SBAITI': 'sbaiti',
-            'POSTGRES_URL_SBAITI_CODE': 'sbaiti_code',
-            'POSTGRES_URL_SCHOOLSTATUS': 'schoolstatus',
-            'POSTGRES_URL_SCHOOLSTATUS_CODE': 'schoolstatus_code',
-            'POSTGRES_URL_SS_ANALYTICS': 'ss_analytics',
-            'POSTGRES_URL_TMS': 'tms'
+            'POSTGRES_URL_DODB': 'postgresql://doadmin:AVNS_hcOw9PEgnb3KoBtO2eu@db-postgresql-nyc3-88579-do-user-18166942-0.h.db.ondigitalocean.com:25060/bjb_tableau'
         }
         
         for env_var, db_name in db_mappings.items():
